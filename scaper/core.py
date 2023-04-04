@@ -34,6 +34,19 @@ from .audio import get_integrated_lufs
 from .audio import peak_normalize
 from .version import version as scaper_version
 
+import librosa 
+from scipy import signal
+
+def load_hrir(az, ele, db, SAMPLE_RATE):
+    SAMPLE_RATE = 41000
+    FORMATS = ["44K_16bit", "48K_24bit", "96K_24bit"]
+    format = "44K_16bit"
+
+    filename = "azi_" + str(az) + ",0_" + "ele_" + str(ele) + ",0.wav"
+    fullpath = "HRIRs/" + db + "_HRIR_WAV/" + format + "/" + filename
+    audio,_ = librosa.load(fullpath, mono=False, sr=SAMPLE_RATE)
+    return audio
+
 
 # HEADS UP! Adding a new distribution tuple?
 # Make sure it's properly handled in all of the following:
@@ -61,7 +74,7 @@ SUPPORTED_DIST = {"const": _sample_const,
 EventSpec = namedtuple(
     'EventSpec',
     ['label', 'source_file', 'source_time', 'event_time', 'event_duration',
-     'snr', 'role', 'pitch_shift', 'time_stretch'])
+     'snr', 'role', 'pitch_shift', 'time_stretch', 'hrir_db', 'hrir_angle'])
 '''
 Container for storing event specifications, either probabilistic (i.e. using
 distribution tuples to specify possible values) or instantiated (i.e. storing
@@ -930,7 +943,7 @@ def _validate_time_stretch(time_stretch_tuple):
 
 def _validate_event(label, source_file, source_time, event_time,
                     event_duration, snr, allowed_labels, pitch_shift,
-                    time_stretch):
+                    time_stretch, hrir_db, hrir_angle):
     '''
     Check that event parameter values are valid.
 
@@ -985,6 +998,8 @@ def _validate_event(label, source_file, source_time, event_time,
 
     # Time stretch
     _validate_time_stretch(time_stretch)
+
+    #TODO ADD VALIDATION OF HRIR DB and HRIR ANGLE
 
 
 class Scaper(object):
@@ -1059,7 +1074,7 @@ class Scaper(object):
         # Initialize parameters
         self.sr = 44100
         self.ref_db = -12
-        self.n_channels = 1
+        self.n_channels = 2
         self.fade_in_len = 0.01  # 10 ms
         self.fade_out_len = 0.01  # 10 ms
 
@@ -1211,7 +1226,7 @@ class Scaper(object):
 
         # Validate parameter format and values
         _validate_event(label, source_file, source_time, event_time,
-                        event_duration, snr, self.bg_labels, None, None)
+                        event_duration, snr, self.bg_labels, None, None, None, None)
 
         # Create background sound event
         bg_event = EventSpec(label=label,
@@ -1222,13 +1237,15 @@ class Scaper(object):
                              snr=snr,
                              role=role,
                              pitch_shift=pitch_shift,
-                             time_stretch=time_stretch)
+                             time_stretch=time_stretch,
+                             hrir_db=None,
+                             hrir_angle=None)
 
         # Add event to background spec
         self.bg_spec.append(bg_event)
 
     def add_event(self, label, source_file, source_time, event_time,
-                  event_duration, snr, pitch_shift, time_stretch):
+                  event_duration, snr, pitch_shift, time_stretch, hrir_db, hrir_angle):
         '''
         Add a foreground sound event to the foreground specification.
 
@@ -1332,7 +1349,7 @@ class Scaper(object):
         # SAFETY CHECKS
         _validate_event(label, source_file, source_time, event_time,
                         event_duration, snr, self.fg_labels, pitch_shift,
-                        time_stretch)
+                        time_stretch, hrir_db, hrir_angle)
 
         # Create event
         event = EventSpec(label=label,
@@ -1343,7 +1360,9 @@ class Scaper(object):
                           snr=snr,
                           role='foreground',
                           pitch_shift=pitch_shift,
-                          time_stretch=time_stretch)
+                          time_stretch=time_stretch,
+                          hrir_db=hrir_db,
+                          hrir_angle=hrir_angle)
 
         # Add event to foreground specification
         self.fg_spec.append(event)
@@ -1424,6 +1443,17 @@ class Scaper(object):
         else:
             label_tuple = event.label
         label = _get_value_from_dist(label_tuple, self.random_state)
+
+        if event.hrir_db != None:
+            hrir_db = _get_value_from_dist(event.hrir_db, self.random_state)
+        else:
+            hrir_db = None
+
+        if event.hrir_angle != None:
+            hrir_angle = _get_value_from_dist(event.hrir_angle, self.random_state)
+            hrir_angle = np.random.randint(hrir_angle[0], hrir_angle[1])
+        else:
+            hrir_angle = None
 
         # Make sure we can use this label
         if (not allow_repeated_label) and (label in used_labels):
@@ -1652,7 +1682,10 @@ class Scaper(object):
                                        snr=snr,
                                        role=role,
                                        pitch_shift=pitch_shift,
-                                       time_stretch=time_stretch)
+                                       time_stretch=time_stretch,
+                                       hrir_db=hrir_db,
+                                       hrir_angle=hrir_angle
+                                       )
         # Return
         return instantiated_event
 
@@ -1994,6 +2027,14 @@ class Scaper(object):
                         channels=self.n_channels
                     )
 
+                    #Load HRTF
+                    db = e.value['hrir_db']
+                    angle = e.value['hrir_angle']
+                    print(db)
+                    print(angle)
+
+                    hrir = load_hrir(angle, 0, db, self.sr)
+
                     # Pitch shift
                     if e.value['pitch_shift'] is not None:
                         tfm.pitch(e.value['pitch_shift'], quick=quick_pitch_time)
@@ -2023,7 +2064,7 @@ class Scaper(object):
                             input_array=event_audio,
                             sample_rate_in=event_sr
                         )
-                        event_audio = event_audio.reshape(-1, self.n_channels)
+                        event_audio = event_audio.reshape(-1, 1)
                         
                         # NOW compute LUFS
                         fg_lufs = get_integrated_lufs(event_audio, self.sr)
@@ -2052,6 +2093,13 @@ class Scaper(object):
                         event_audio = np.pad(event_audio, ((prepad, postpad), (0, 0)), 
                             mode='constant', constant_values=(0, 0))
                         event_audio = event_audio[:duration_in_samples]
+                        event_audio = event_audio[:,0]
+                        
+                        #convolve audio
+                        left = signal.convolve(event_audio, hrir[0], mode='same')
+                        right = signal.convolve(event_audio, hrir[1], mode='same')
+
+                        event_audio = np.array([left, right]).T
 
                         event_audio_list.append(event_audio[:duration_in_samples])
                 else:
